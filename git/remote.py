@@ -16,6 +16,7 @@ from git.compat import defenc, force_text
 from git.config import GitConfigParser, SectionConstraint, cp
 from git.exc import GitCommandError, UnsafeOptionError
 from git.refs import Head, Reference, RemoteReference, SymbolicReference, TagReference
+from git.remote_handoff import RemoteHandoffLedger, remote_handoff as _remote_handoff
 from git.util import (
     CallableRemoteProgress,
     IterableList,
@@ -49,6 +50,7 @@ from git.types import AnyGitObject, Literal, PathLike
 if TYPE_CHECKING:
     from git.objects.commit import Commit
     from git.objects.submodule.base import UpdateProgress
+    from git.remote_handoff import RemoteGenerationScope, RemoteHandoff
     from git.repo.base import Repo
 
 _T_RemoteName = TypeVar("_T_RemoteName", bound=Union[str, "Remote"])
@@ -808,13 +810,22 @@ class Remote(LazyMixin, IterableObj):
 
         :raise git.exc.GitCommandError:
             In case an origin with that name already exists.
+
+        Mounting is the
+        :attr:`~git.remote_handoff.RemoteHandoffLedger.MOUNT` ledger of the
+        remote handoff generations: under an active generation the new remote
+        is mounted only when the current generation's mount intent is live,
+        and a rolling-back or superseded generation unmounts it again.
         """
         scmd = "add"
         kwargs["insert_kwargs_after"] = scmd
         url = Git.polish_url(url, expand_vars=False)
         if not allow_unsafe_protocols:
             Git.check_unsafe_protocols(url)
+        mount_intent = _remote_handoff(repo).claim(RemoteHandoffLedger.MOUNT, name)
+        mount_intent.check("remote-add", name)
         repo.git.remote(scmd, "--", name, url, **kwargs)
+        mount_intent.remember_remote_add(name)
         return cls(repo, name)
 
     # `add` is an alias.
@@ -828,7 +839,16 @@ class Remote(LazyMixin, IterableObj):
 
         :return:
             The passed remote name to remove
+
+        Unmounting is fenced on the
+        :attr:`~git.remote_handoff.RemoteHandoffLedger.MOUNT` ledger; under an
+        active generation the remote's configuration is snapshotted so a
+        rolling-back generation replays the mount (URLs and fetch refspecs).
         """
+        label = str(name)
+        mount_intent = _remote_handoff(repo).claim(RemoteHandoffLedger.MOUNT, label)
+        mount_intent.check("remote-rm", label)
+        mount_intent.remember_remote_remove(label)
         repo.git.remote("rm", name)
         remote = name
         if isinstance(remote, cls):
@@ -850,11 +870,19 @@ class Remote(LazyMixin, IterableObj):
 
         :return:
             self
+
+        Renaming a remote mount is fenced on the
+        :attr:`~git.remote_handoff.RemoteHandoffLedger.MOUNT` ledger; a
+        rolling-back generation renames the mount back.
         """
         if self.name == new_name:
             return self
 
-        self.repo.git.remote("rename", self.name, new_name)
+        old_name = self.name
+        mount_intent = _remote_handoff(self.repo).claim(RemoteHandoffLedger.MOUNT, old_name)
+        mount_intent.check("remote-rename", old_name, detail=new_name)
+        mount_intent.remember_remote_rename(old_name, new_name)
+        self.repo.git.remote("rename", old_name, new_name)
         self.name = new_name
         self._clear_cache()
 
@@ -878,6 +906,30 @@ class Remote(LazyMixin, IterableObj):
         kwargs["insert_kwargs_after"] = scmd
         self.repo.git.remote(scmd, self.name, **kwargs)
         return self
+
+    @property
+    def handoff(self) -> "RemoteHandoff":
+        """The :class:`~git.remote_handoff.RemoteHandoff` registry of this
+        remote's repository.
+
+        Every :class:`Remote` on the same :class:`~git.repo.base.Repo`
+        (``repo.remotes``, ``repo.remote()``, ``repo.create_remote()`` or a
+        temporary ``Remote(repo, ...)``) returns the same registry instance;
+        remote handles on a different repository never do.
+        """
+        return _remote_handoff(self.repo)
+
+    @classmethod
+    @contextlib.contextmanager
+    def handoff_generation(cls, repo: "Repo", declare: Optional[int] = None) -> Iterator["RemoteGenerationScope"]:
+        """Open a remote fetch/push handoff generation on *repo*.
+
+        Equivalent to ``remote_handoff(repo).generation(declare=declare)``.
+        See :mod:`git.remote_handoff` for the semantics of nesting, stale
+        intents and rollback.
+        """
+        with _remote_handoff(repo).generation(declare=declare) as scope:
+            yield scope
 
     def _get_fetch_info_from_stderr(
         self,
@@ -1062,10 +1114,20 @@ class Remote(LazyMixin, IterableObj):
         :note:
             As fetch does not provide progress information to non-ttys, we cannot make
             it available here unfortunately as in the :meth:`push` method.
+
+        When a remote handoff generation is active on this remote's repository,
+        the fetch claims a :attr:`~git.remote_handoff.RemoteHandoffLedger.FETCH`
+        intent for that generation. If the generation advances while the fetch
+        is in flight, the remote-tracking refs the command moved are restored
+        before :class:`~git.exc.StaleRemoteGenerationError` is raised.
         """
         if refspec is None:
             # No argument refspec, then ensure the repo's config has a fetch refspec.
             self._assert_refspec()
+
+        intent = _remote_handoff(self.repo).claim(RemoteHandoffLedger.FETCH, self.name)
+        intent.check("fetch", self.name)
+        intent.remember_fetch(self.name)
 
         kwargs = add_progress(kwargs, self.repo.git, progress)
         if isinstance(refspec, list):
@@ -1086,6 +1148,7 @@ class Remote(LazyMixin, IterableObj):
             "--", self, *args, as_process=True, with_stdout=False, universal_newlines=True, v=bool(verbose), **kwargs
         )
         res = self._get_fetch_info_from_stderr(proc, progress, kill_after_timeout=kill_after_timeout)
+        intent.land_fetch_infos(res)
         if hasattr(self.repo.odb, "update_cache"):
             self.repo.odb.update_cache()
         return res
@@ -1123,10 +1186,25 @@ class Remote(LazyMixin, IterableObj):
 
         :return:
             Please see :meth:`fetch` method.
+
+        Although a pull returns :class:`FetchInfo` objects just like
+        :meth:`fetch`, it runs the :manpage:`git-pull(1)` command path and
+        drives a merge on top of the fetch. Under a remote handoff generation
+        it therefore claims a
+        :attr:`~git.remote_handoff.RemoteHandoffLedger.PULL_MERGE` intent --
+        not the bare-:attr:`~git.remote_handoff.RemoteHandoffLedger.FETCH`
+        intent -- so the merge drive (``HEAD``/index/worktree, ``ORIG_HEAD``,
+        possible ``MERGE_HEAD``) and the fetch half of the same ``git pull``
+        invocation bounce together if the generation advances or fails.
         """
         if refspec is None:
             # No argument refspec, then ensure the repo's config has a fetch refspec.
             self._assert_refspec()
+
+        pull_intent = _remote_handoff(self.repo).claim(RemoteHandoffLedger.PULL_MERGE, self.name)
+        pull_intent.check("pull", self.name)
+        pull_state = pull_intent.remember_pull(self.name)
+
         kwargs = add_progress(kwargs, self.repo.git, progress)
 
         refspec = Git._unpack_args(refspec or [])
@@ -1149,6 +1227,10 @@ class Remote(LazyMixin, IterableObj):
             "--", self, refspec, with_stdout=False, as_process=True, universal_newlines=True, v=True, **kwargs
         )
         res = self._get_fetch_info_from_stderr(proc, progress, kill_after_timeout=kill_after_timeout)
+        # The FetchInfo objects of a pull are stamped on the PULL_MERGE ledger,
+        # never on the bare-fetch ledger.
+        pull_intent.land_fetch_infos(res, op="pull")
+        pull_intent.land_pull_head(pull_state)
         if hasattr(self.repo.odb, "update_cache"):
             self.repo.odb.update_cache()
         return res
@@ -1207,7 +1289,22 @@ class Remote(LazyMixin, IterableObj):
 
             Call :meth:`~PushInfoList.raise_if_error` on the returned object to raise on
             any failure.
+
+        Under a remote handoff generation the push claims a
+        :attr:`~git.remote_handoff.RemoteHandoffLedger.PUSH` intent, which is a
+        separate ledger from fetch and pull: the porcelain
+        :class:`PushInfo` result path lands independently. A partial push whose
+        failure is only attached to ``PushInfoList.error`` is still recorded on
+        that ledger; if the host later raises it inside the generation, the
+        generation rollback pushes the remote tips back to their pre-push state
+        over a local transport. If the generation advances while the push is in
+        flight, the same bounce happens before
+        :class:`~git.exc.StaleRemoteGenerationError` is raised.
         """
+        intent = _remote_handoff(self.repo).claim(RemoteHandoffLedger.PUSH, self.name)
+        intent.check("push", self.name)
+        intent.remember_push(self.name)
+
         kwargs = add_progress(kwargs, self.repo.git, progress)
 
         refspec = Git._unpack_args(refspec or [])
@@ -1230,7 +1327,9 @@ class Remote(LazyMixin, IterableObj):
             kill_after_timeout=kill_after_timeout,
             **kwargs,
         )
-        return self._get_push_info(proc, progress, kill_after_timeout=kill_after_timeout)
+        res = self._get_push_info(proc, progress, kill_after_timeout=kill_after_timeout)
+        intent.land_push_infos(res)
+        return res
 
     @property
     def config_reader(self) -> SectionConstraint[GitConfigParser]:

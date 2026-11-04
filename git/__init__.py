@@ -54,6 +54,11 @@ __all__ = [
     "RefLogEntry",
     "Reference",
     "Remote",
+    "RemoteGenerationScope",
+    "RemoteHandoff",
+    "RemoteHandoffLedger",
+    "RemoteIntent",
+    "RemoteLanding",
     "RemoteProgress",
     "RemoteReference",
     "Repo",
@@ -63,6 +68,7 @@ __all__ = [
     "Sequence",  # Deprecated - import from `typing`, or `collections.abc` in 3.9+.
     "StageType",
     "Stats",
+    "StaleRemoteGenerationError",
     "Submodule",
     "SymbolicReference",
     "TYPE_CHECKING",  # Deprecated - import this from `typing` instead.
@@ -80,6 +86,8 @@ __all__ = [
     "UpdateProgress",
     "WorkTreeRepositoryUnsupported",
     "refresh",
+    "remote_generation",
+    "remote_handoff",
     "remove_password_if_present",
     "rmtree",
     "safe_decode",
@@ -115,6 +123,7 @@ from git.exc import (
     ODBError,
     ParseError,
     RepositoryDirtyError,
+    StaleRemoteGenerationError,
     UnmergedEntriesError,
     UnsafeOptionError,
     UnsafeProtocolError,
@@ -162,6 +171,15 @@ try:
     from git.cmd import Git  # @NoMove
     from git.repo import Repo  # @NoMove
     from git.remote import FetchInfo, PushInfo, Remote, RemoteProgress  # @NoMove
+    from git.remote_handoff import (  # @NoMove
+        RemoteGenerationScope,
+        RemoteHandoff,
+        RemoteHandoffLedger,
+        RemoteIntent,
+        RemoteLanding,
+        remote_generation,
+        remote_handoff,
+    )
     from git.index import (  # @NoMove
         BaseIndexEntry,
         BlobFilter,

@@ -30,6 +30,8 @@ __all__ = [
     "UnmergedEntriesError",
     "HookExecutionError",
     "RepositoryDirtyError",
+    "RemoteGenerationError",
+    "StaleRemoteGenerationError",
 ]
 
 from gitdb.exc import (
@@ -226,3 +228,19 @@ class RepositoryDirtyError(GitError):
 
     def __str__(self) -> str:
         return "Operation cannot be performed on %r: %s" % (self.repo, self.message)
+
+
+class RemoteGenerationError(RuntimeError):
+    """Base class for failures of the remote handoff-generation protocol."""
+
+
+class StaleRemoteGenerationError(RemoteGenerationError):
+    """Raised when a remote intent of a superseded generation attempts to land.
+
+    A fetch, push or pull that started in one generation is not allowed to settle
+    on the remote-reference ledger of a newer generation. For in-flight operations
+    the footprints the command did leave (moved remote-tracking refs, pushed
+    remote tips or a driven merge) are bounced before this exception is raised, so
+    the newer generation's ledger stays intact. The host may open or claim a fresh
+    generation and retry the operation.
+    """

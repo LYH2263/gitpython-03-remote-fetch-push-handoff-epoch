@@ -7,6 +7,7 @@ from __future__ import annotations
 
 __all__ = ["Repo"]
 
+import contextlib
 import gc
 import logging
 import os
@@ -35,6 +36,7 @@ from git.index import IndexFile
 from git.objects import Submodule, RootModule, Commit
 from git.refs import HEAD, Head, Reference, TagReference
 from git.remote import Remote, _T_RemoteName, add_progress, to_progress_instance
+from git.remote_handoff import remote_handoff as _remote_handoff
 from git.util import (
     Actor,
     cygpath,
@@ -89,6 +91,7 @@ if TYPE_CHECKING:
     from git.objects.submodule.base import UpdateProgress
     from git.refs.symbolic import SymbolicReference
     from git.remote import RemoteProgress
+    from git.remote_handoff import RemoteGenerationScope, RemoteHandoff
     from git.util import IterableList
 
 # -----------------------------------------------------------
@@ -579,6 +582,27 @@ class Repo:
             raise ValueError("Remote named '%s' didn't exist" % name)
         return r
 
+    @property
+    def remote_handoff(self) -> "RemoteHandoff":
+        """The remote fetch/push handoff-generation registry for this repository.
+
+        The same registry instance backs every :class:`~git.remote.Remote`
+        mounted on this repository (including ``self.remotes``,
+        :meth:`remote`, :meth:`create_remote` and temporary
+        ``Remote(self, ...)`` handles). Different repository instances never
+        share a registry. See :mod:`git.remote_handoff`.
+        """
+        return _remote_handoff(self)
+
+    @contextlib.contextmanager
+    def remote_generation(self, declare: Optional[int] = None) -> "Iterator[RemoteGenerationScope]":
+        """Open a remote fetch/push handoff generation on this repository.
+
+        Shorthand for ``self.remote_handoff.generation(declare=declare)``.
+        """
+        with _remote_handoff(self).generation(declare=declare) as scope:
+            yield scope
+
     # { Submodules
 
     @property
@@ -724,13 +748,24 @@ class Repo:
         For more information, please see the documentation of the
         :meth:`Remote.create <git.remote.Remote.create>` method.
 
+        The mounted remote is bound to this repository's remote handoff
+        generation registry (see :attr:`remote_handoff`).
+
         :return:
             :class:`~git.remote.Remote` reference
         """
-        return Remote.create(self, name, url, **kwargs)
+        remote = Remote.create(self, name, url, **kwargs)
+        assert remote.handoff is self.remote_handoff, (
+            "mounted remote %r is not bound to this repository's remote handoff registry" % name
+        )
+        return remote
 
     def delete_remote(self, remote: _T_RemoteName) -> _T_RemoteName:
-        """Delete the given remote."""
+        """Delete the given remote.
+
+        Like :meth:`create_remote`, unmounting is fenced on this repository's
+        remote handoff generation registry.
+        """
         return Remote.remove(self, remote)
 
     def _get_config_path(self, config_level: Lit_config_levels, git_dir: Optional[PathLike] = None) -> str:
