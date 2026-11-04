@@ -43,7 +43,7 @@ jobs:
         fetch-depth: 0
 
     - name: Install Cygwin
-      uses: cygwin/cygwin-install-action@v6
+      uses: cygwin/cygwin-install-action@v7
       with:
         packages: curl git python39 python-setuptools-wheel
         add-to-path: false  # No need to change $PATH outside the Cygwin environment.
